@@ -1,6 +1,6 @@
 calendar_names:
-  A: "My Deadlines - A"
-  B: "My Deadlines - B"
+  A: "conf_A"
+  B: "conf_B"
 
 A_conferences:
   - aaai
