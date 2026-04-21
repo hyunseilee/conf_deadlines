@@ -145,7 +145,7 @@ def load_ccfddl_entries():
     return out
 
 
-def build_calendar(calendar_name: str, conference_keys: set[str], ccfddl_by_dblp: dict):
+def build_calendar(calendar_name: str, conference_keys, ccfddl_by_dblp):
     cal = Calendar()
     cal.add("prodid", f"-//{calendar_name}//")
     cal.add("version", "2.0")
