@@ -1,28 +1,38 @@
-import csv
-import io
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 import yaml
 from icalendar import Calendar, Event
 
-# Your ranking source gist
-GIST_ID = "6eb933355b5cb8d31ef1abcb3c3e1206"
+# ----------------------------
+# Config
+# ----------------------------
 
-# CCFDDL source
 CCFDDL_API = "https://api.github.com/repos/ccfddl/ccf-deadlines/contents/conference"
 
 OUT_DIR = Path("site")
 OUT_DIR.mkdir(exist_ok=True)
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "Accept": "application/vnd.github+json",
-    "User-Agent": "cs-deadline-calendar"
-})
+MAX_WORKERS = 8
 
-ALIASES = {
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "cs-deadline-calendar",
+    }
+)
+
+# ----------------------------
+# Aliases
+# ----------------------------
+
+# User shorthand -> CCFDDL/ranking key
+RANK_ALIASES: Dict[str, str] = {
     "atc": "usenix",
     "bigdata": "bigdataconf",
     "neurips": "nips",
@@ -30,33 +40,205 @@ ALIASES = {
     "ubicomp": "huc",
 }
 
+# Ranking/manual key -> CCFDDL key
+CCFDDL_ALIASES: Dict[str, str] = {
+    "ieeepact": "pact",
+}
+
+# ----------------------------
+# HTTP helpers
+# ----------------------------
+
 def get_json(url: str):
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-def get_text(url: str):
+def get_text(url: str) -> str:
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
     return r.text
 
+
+# ----------------------------
+# Local file helpers
+# ----------------------------
 
 def load_yaml(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def normalize_conf_name(x: str) -> str:
-    return x.strip().lower()
+def normalize_conf_name(name: str) -> str:
+    return name.strip().lower()
 
 
-def parse_timezone(tz_str: str):
-    # CCFDDL supports UTC±X and AoE
+# ----------------------------
+# Interested list
+# ----------------------------
+
+def normalize_conf_list(items: List[object]) -> Set[str]:
+    out: Set[str] = set()
+    for item in items or []:
+        key = normalize_conf_name(str(item))
+        key = RANK_ALIASES.get(key, key)
+        out.add(key)
+    return out
+
+
+def load_interested() -> Tuple[str, str, Set[str], Set[str]]:
+    cfg = load_yaml("interested.yml") or {}
+
+    calendar_names = cfg.get("calendar_names", {})
+    calendar_name_a = calendar_names.get("A", "My Deadlines - A")
+    calendar_name_b = calendar_names.get("B", "My Deadlines - B")
+
+    selected_a = normalize_conf_list(cfg.get("A_conferences", []))
+    selected_b = normalize_conf_list(cfg.get("B_conferences", []))
+
+    return calendar_name_a, calendar_name_b, selected_a, selected_b
+
+
+# ----------------------------
+# Key remapping
+# ----------------------------
+
+def remap_for_ccfddl(keys: Set[str]) -> Set[str]:
+    return {CCFDDL_ALIASES.get(k, k) for k in keys}
+
+
+# ----------------------------
+# CCFDDL loader
+# ----------------------------
+
+def list_ccfddl_files() -> Dict[str, str]:
+    """
+    Returns:
+      dict[filename_without_ext] -> download_url
+    """
+    out: Dict[str, str] = {}
+
+    top = get_json(CCFDDL_API)
+    for category in top:
+        if category.get("type") != "dir":
+            continue
+
+        children = get_json(category["url"])
+        for item in children:
+            name = str(item.get("name", ""))
+            if item.get("type") == "file" and name.endswith(".yml"):
+                stem = name[:-4].lower()
+                out[stem] = item["download_url"]
+
+    return out
+
+
+def fetch_ccfddl_record(url: str) -> List[dict]:
+    records = yaml.safe_load(get_text(url))
+    if not isinstance(records, list):
+        return []
+    return records
+
+
+def add_records_to_index(out: Dict[str, List[dict]], records: List[dict]) -> None:
+    for rec in records:
+        dblp = str(rec.get("dblp", "")).strip().lower()
+        if not dblp:
+            continue
+        out.setdefault(dblp, []).append(rec)
+
+
+def fetch_urls_parallel(urls: List[str], max_workers: int = 8) -> List[List[dict]]:
+    results: List[List[dict]] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_ccfddl_record, url): url for url in urls}
+
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                print(f"Failed to fetch {url}: {exc}", file=sys.stderr)
+
+    return results
+
+
+def load_ccfddl_entries_for_keys(requested_keys: Set[str]) -> Dict[str, List[dict]]:
+    """
+    Fast path:
+      - fetch files whose filename stem matches requested keys
+
+    Fallback:
+      - if some requested dblp keys are still unresolved, scan the remaining YAML files
+        and match by internal 'dblp' field instead of filename.
+    """
+    file_map = list_ccfddl_files()
+    out: Dict[str, List[dict]] = {}
+
+    # Fast path
+    direct_urls: List[str] = []
+    direct_stems: Set[str] = set()
+
+    for key in sorted(requested_keys):
+        if key in file_map:
+            direct_urls.append(file_map[key])
+            direct_stems.add(key)
+
+    for records in fetch_urls_parallel(direct_urls, max_workers=MAX_WORKERS):
+        add_records_to_index(out, records)
+
+    unresolved = requested_keys - set(out.keys())
+    if not unresolved:
+        return out
+
+    print("Falling back to content scan for:", sorted(unresolved))
+
+    remaining_urls: List[str] = [
+        url for stem, url in file_map.items() if stem not in direct_stems
+    ]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_ccfddl_record, url): url for url in remaining_urls}
+
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                records = future.result()
+            except Exception as exc:
+                print(f"Failed to fetch {url}: {exc}", file=sys.stderr)
+                continue
+
+            matched_any = False
+            for rec in records:
+                dblp = str(rec.get("dblp", "")).strip().lower()
+                if dblp and dblp in unresolved:
+                    out.setdefault(dblp, []).append(rec)
+                    matched_any = True
+
+            if matched_any:
+                unresolved = requested_keys - set(out.keys())
+                if not unresolved:
+                    break
+
+    if unresolved:
+        print("Still not found in CCFDDL after fallback scan:", sorted(unresolved))
+
+    return out
+
+
+# ----------------------------
+# Timezone parsing
+# ----------------------------
+
+def parse_timezone(tz_str: Optional[str]):
     if not tz_str or tz_str == "AoE":
         return timezone(timedelta(hours=-12))
-    if tz_str == "UTC":
+
+    if tz_str in ("UTC", "UTC+0"):
         return timezone.utc
+
     if tz_str.startswith("UTC"):
         s = tz_str[3:]
         sign = 1
@@ -65,115 +247,44 @@ def parse_timezone(tz_str: str):
         elif s.startswith("-"):
             sign = -1
             s = s[1:]
-        hours = int(s)
-        return timezone(timedelta(hours=sign * hours))
+
+        try:
+            hours = int(s)
+            return timezone(timedelta(hours=sign * hours))
+        except ValueError:
+            return timezone.utc
+
     return timezone.utc
 
 
-def load_interested():
-    cfg = load_yaml("interested.yml") or {}
-    raw = cfg.get("interested_conferences", [])
-    normalized = set()
+# ----------------------------
+# Calendar generation
+# ----------------------------
 
-    for x in raw:
-        key = normalize_conf_name(x)
-        key = ALIASES.get(key, key)
-        normalized.add(key)
-
-    return normalized
+def make_event_uid(dblp: str, year: object, deadline: str, comment: str) -> str:
+    safe_comment = str(comment).replace("\n", " ").strip()
+    return f"{dblp}-{year}-{deadline}-{safe_comment}@cs-deadline-calendar"
 
 
-def get_gist_csv_raw_url() -> str:
-    gist = get_json(f"https://api.github.com/gists/{GIST_ID}")
-    files = gist.get("files", {})
-    for _, meta in files.items():
-        filename = meta.get("filename", "")
-        if filename.endswith(".csv"):
-            return meta["raw_url"]
-    raise RuntimeError("Could not find CSV file in gist.")
-
-
-def load_rank_sets():
-    """
-    Build:
-      A = conferences marked '최우수'
-      B = conferences marked '우수'
-    using the gist's DBLP Key column.
-    """
-    raw_url = get_gist_csv_raw_url()
-    csv_text = get_text(raw_url)
-
-    A = set()
-    B = set()
-
-    reader = csv.DictReader(io.StringIO(csv_text))
-    for row in reader:
-        rank = (row.get("한국정보과학회 (2024)") or "").strip()
-        dblp_key = (row.get("DBLP Key") or "").strip()
-
-        if not dblp_key:
-            continue
-
-        # Examples:
-        # conf/aaai -> aaai
-        # conf/ifaamas -> ifaamas
-        # conf/www -> www
-        conf_key = dblp_key.split("/")[-1].strip().lower()
-
-        if rank == "최우수":
-            A.add(conf_key)
-        elif rank == "우수":
-            B.add(conf_key)
-
-    return A, B
-
-
-def iter_ccfddl_yaml_urls():
-    top = get_json(CCFDDL_API)
-    for category in top:
-        if category["type"] != "dir":
-            continue
-        children = get_json(category["url"])
-        for item in children:
-            if item["type"] == "file" and item["name"].endswith(".yml"):
-                yield item["download_url"]
-
-
-def load_ccfddl_entries():
-    """
-    Returns:
-      dict[dblp_suffix] -> list[conference_record]
-    """
-    out = {}
-    for url in iter_ccfddl_yaml_urls():
-        text = get_text(url)
-        records = yaml.safe_load(text)
-        if not isinstance(records, list):
-            continue
-
-        for rec in records:
-            dblp = (rec.get("dblp") or "").strip().lower()
-            if not dblp:
-                continue
-            out.setdefault(dblp, []).append(rec)
-
-    return out
-
-
-def build_calendar(calendar_name: str, conference_keys, ccfddl_by_dblp):
+def build_calendar(
+    calendar_name: str,
+    conference_keys: Set[str],
+    ccfddl_by_dblp: Dict[str, List[dict]],
+) -> Calendar:
     cal = Calendar()
     cal.add("prodid", f"-//{calendar_name}//")
     cal.add("version", "2.0")
     cal.add("X-WR-CALNAME", calendar_name)
-    cal.add("X-WR-CALDESC", f"{calendar_name} from CCFDDL + 정보과학회 ranking")
-    now = datetime.now(timezone.utc)
+    cal.add("X-WR-CALDESC", calendar_name)
 
-    seen = set()
+    now = datetime.now(timezone.utc)
+    seen_uids: Set[str] = set()
 
     for dblp in sorted(conference_keys):
-        for conf in ccfddl_by_dblp.get(dblp, []):
+        records = ccfddl_by_dblp.get(dblp, [])
+        for conf in records:
             title = conf.get("title", dblp.upper())
-            desc = conf.get("description", "")
+            description = conf.get("description", "")
 
             for edition in conf.get("confs", []):
                 year = edition.get("year")
@@ -181,37 +292,45 @@ def build_calendar(calendar_name: str, conference_keys, ccfddl_by_dblp):
                 tzinfo = parse_timezone(edition.get("timezone", "AoE"))
 
                 for tl in edition.get("timeline", []):
-                    ddl = tl.get("deadline")
+                    deadline = tl.get("deadline")
                     comment = tl.get("comment", "Deadline")
 
-                    if not ddl or ddl == "TBD":
+                    if not deadline or deadline == "TBD":
                         continue
 
-                    dt = datetime.strptime(ddl, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tzinfo)
+                    try:
+                        dt = datetime.strptime(
+                            deadline, "%Y-%m-%d %H:%M:%S"
+                        ).replace(tzinfo=tzinfo)
+                    except ValueError:
+                        continue
 
-                    # only future deadlines
                     if dt.astimezone(timezone.utc) < now:
                         continue
 
-                    uid = f"{dblp}-{year}-{ddl}-{comment}"
-                    if uid in seen:
+                    uid = make_event_uid(dblp, year, deadline, comment)
+                    if uid in seen_uids:
                         continue
-                    seen.add(uid)
+                    seen_uids.add(uid)
 
                     ev = Event()
+                    ev.add("uid", uid)
+                    ev.add("dtstamp", now)
                     ev.add("summary", f"{title} {year} — {comment}")
                     ev.add("dtstart", dt)
                     ev.add("dtend", dt + timedelta(hours=1))
-                    ev.add("dtstamp", now)
-                    ev.add("uid", uid + "@cs-deadline-calendar")
-                    ev.add(
-                        "description",
-                        f"{title} {year}\n"
-                        f"{comment}\n"
-                        f"{desc}\n"
-                        f"DBLP key: {dblp}\n"
-                        f"{link}"
-                    )
+
+                    desc_lines = [
+                        f"{title} {year}",
+                        str(comment),
+                        str(description),
+                        f"DBLP key: {dblp}",
+                    ]
+                    if link:
+                        desc_lines.append(str(link))
+
+                    ev.add("description", "\n".join(desc_lines))
+
                     if link:
                         ev.add("url", link)
 
@@ -220,7 +339,11 @@ def build_calendar(calendar_name: str, conference_keys, ccfddl_by_dblp):
     return cal
 
 
-def write_index():
+# ----------------------------
+# Output helpers
+# ----------------------------
+
+def write_index() -> None:
     html = """<!doctype html>
 <html>
 <head>
@@ -240,40 +363,50 @@ def write_index():
     (OUT_DIR / ".nojekyll").write_text("", encoding="utf-8")
 
 
-def main():
-    interested = load_interested()
-    rank_A, rank_B = load_rank_sets()
-    ccfddl_by_dblp = load_ccfddl_entries()
+# ----------------------------
+# Main
+# ----------------------------
 
-    selected_A = interested & rank_A
-    selected_B = interested & rank_B
+def main() -> int:
+    try:
+        calendar_name_a, calendar_name_b, selected_a_rank, selected_b_rank = load_interested()
 
-    # Helpful diagnostics
-    ranked_union = rank_A | rank_B
-    unranked = sorted(interested - ranked_union)
-    missing_in_ccfddl = sorted(
-        (selected_A | selected_B) - set(ccfddl_by_dblp.keys())
-    )
+        selected_a_ccfddl = remap_for_ccfddl(selected_a_rank)
+        selected_b_ccfddl = remap_for_ccfddl(selected_b_rank)
 
-    print("Selected for A:", sorted(selected_A))
-    print("Selected for B:", sorted(selected_B))
-    print("Not found in gist A/B ranking:", unranked)
-    print("Ranked but not found in CCFDDL:", missing_in_ccfddl)
+        needed_keys = selected_a_ccfddl | selected_b_ccfddl
+        ccfddl_by_dblp = load_ccfddl_entries_for_keys(needed_keys)
 
-    cal_A = build_calendar("My Deadlines - A", selected_A, ccfddl_by_dblp)
-    cal_B = build_calendar("My Deadlines - B", selected_B, ccfddl_by_dblp)
+        missing_in_ccfddl = sorted(
+            (selected_a_ccfddl | selected_b_ccfddl) - set(ccfddl_by_dblp.keys())
+        )
 
-    with open(OUT_DIR / "A.ics", "wb") as f:
-        f.write(cal_A.to_ical())
+        print("Selected for A:", sorted(selected_a_rank))
+        print("Selected for B:", sorted(selected_b_rank))
+        print("Selected for A (CCFDDL keys):", sorted(selected_a_ccfddl))
+        print("Selected for B (CCFDDL keys):", sorted(selected_b_ccfddl))
+        print("Ranked but not found in CCFDDL:", missing_in_ccfddl)
 
-    with open(OUT_DIR / "B.ics", "wb") as f:
-        f.write(cal_B.to_ical())
+        cal_a = build_calendar(calendar_name_a, selected_a_ccfddl, ccfddl_by_dblp)
+        cal_b = build_calendar(calendar_name_b, selected_b_ccfddl, ccfddl_by_dblp)
 
-    write_index()
+        with open(OUT_DIR / "A.ics", "wb") as f:
+            f.write(cal_a.to_ical())
 
-    print("Wrote site/A.ics")
-    print("Wrote site/B.ics")
+        with open(OUT_DIR / "B.ics", "wb") as f:
+            f.write(cal_b.to_ical())
+
+        write_index()
+
+        print("Wrote site/A.ics")
+        print("Wrote site/B.ics")
+        print("Wrote site/index.html")
+        return 0
+
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
