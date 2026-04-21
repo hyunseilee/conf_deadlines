@@ -91,8 +91,8 @@ def load_interested() -> Tuple[str, str, Set[str], Set[str]]:
     cfg = load_yaml("interested.yml") or {}
 
     calendar_names = cfg.get("calendar_names", {})
-    calendar_name_a = calendar_names.get("A", "My Deadlines - A")
-    calendar_name_b = calendar_names.get("B", "My Deadlines - B")
+    calendar_name_a = calendar_names.get("A", "conf_A")
+    calendar_name_b = calendar_names.get("B", "conf_B")
 
     selected_a = normalize_conf_list(cfg.get("A_conferences", []))
     selected_b = normalize_conf_list(cfg.get("B_conferences", []))
