@@ -22,6 +22,13 @@ SESSION.headers.update({
     "User-Agent": "cs-deadline-calendar"
 })
 
+ALIASES = {
+    "atc": "usenix",
+    "bigdata": "bigdataconf",
+    "neurips": "nips",
+    "pact": "ieeepact",
+    "ubicomp": "huc",
+}
 
 def get_json(url: str):
     r = SESSION.get(url, timeout=30)
@@ -65,7 +72,15 @@ def parse_timezone(tz_str: str):
 
 def load_interested():
     cfg = load_yaml("interested.yml") or {}
-    return {normalize_conf_name(x) for x in cfg.get("interested_conferences", [])}
+    raw = cfg.get("interested_conferences", [])
+    normalized = set()
+
+    for x in raw:
+        key = normalize_conf_name(x)
+        key = ALIASES.get(key, key)
+        normalized.add(key)
+
+    return normalized
 
 
 def get_gist_csv_raw_url() -> str:
