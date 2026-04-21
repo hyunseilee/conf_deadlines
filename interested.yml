@@ -1,34 +1,27 @@
-interested_conferences:
+calendar_names:
+  A: "My Deadlines - A"
+  B: "My Deadlines - B"
+
+A_conferences:
   - aaai
   - acl
-  - aistats
   - asplos
-  - bigdata
   - cikm
   - cvpr
   - dac
-  - date
   - eccv
   - emnlp
-  - emsoft
   - eurosys
   - hpca
-  - hpdc
-  - iccad
-  - iccd
   - iccv
   - icde
   - icdm
   - iclr
   - icml
-  - icra
-  - ijcai
   - infocom
-  - iros
   - isca
   - kdd
   - micro
-  - mlsys
   - mobicom
   - mobisys
   - neurips
@@ -50,3 +43,16 @@ interested_conferences:
   - vldb
   - wsdm
   - www
+
+B_conferences:
+  - aistats
+  - bigdata
+  - date
+  - emsoft
+  - hpdc
+  - iccad
+  - iccd
+  - icra
+  - ijcai
+  - iros
+  - mlsys
