@@ -261,9 +261,76 @@ def parse_timezone(tz_str: Optional[str]):
 # Calendar generation
 # ----------------------------
 
-def make_event_uid(dblp: str, year: object, deadline: str, comment: str) -> str:
-    safe_comment = str(comment).replace("\n", " ").strip()
-    return f"{dblp}-{year}-{deadline}-{safe_comment}@cs-deadline-calendar"
+def make_event_uid(dblp: str, year: object, deadline: str, label: str) -> str:
+    safe_label = str(label).replace("\n", " ").strip()
+    return f"{dblp}-{year}-{deadline}-{safe_label}@cs-deadline-calendar"
+
+
+def add_deadline_event(
+    cal: Calendar,
+    seen_uids: Set[str],
+    now: datetime,
+    dblp: str,
+    title: str,
+    year: object,
+    description: str,
+    conf_date: str,
+    conf_place: str,
+    link: str,
+    tzinfo,
+    deadline_value: str,
+    event_label: str,
+) -> None:
+    if not deadline_value or deadline_value == "TBD":
+        return
+
+    try:
+        dt = datetime.strptime(deadline_value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tzinfo)
+    except ValueError:
+        return
+
+    if dt.astimezone(timezone.utc) < now:
+        return
+
+    uid = make_event_uid(dblp, year, deadline_value, event_label)
+    if uid in seen_uids:
+        return
+    seen_uids.add(uid)
+
+    summary_parts = [f"{title} {year}", event_label]
+    if conf_date:
+        summary_parts.append(f"[{conf_date}]")
+
+    ev = Event()
+    ev.add("uid", uid)
+    ev.add("dtstamp", now)
+    ev.add("summary", " — ".join(summary_parts[:2]) + (f" {summary_parts[2]}" if len(summary_parts) > 2 else ""))
+    ev.add("dtstart", dt)
+    ev.add("dtend", dt + timedelta(hours=1))
+
+    if conf_place:
+        ev.add("location", conf_place)
+
+    desc_lines = [
+        f"{title} {year}",
+        f"Deadline type: {event_label}",
+    ]
+
+    if description:
+        desc_lines.append(str(description))
+    if conf_date:
+        desc_lines.append(f"Conference dates: {conf_date}")
+    if conf_place:
+        desc_lines.append(f"Location: {conf_place}")
+
+    desc_lines.append(f"DBLP key: {dblp}")
+
+    if link:
+        desc_lines.append(str(link))
+        ev.add("url", link)
+
+    ev.add("description", "\n".join(desc_lines))
+    cal.add_component(ev)
 
 
 def build_calendar(
@@ -290,54 +357,53 @@ def build_calendar(
                 year = edition.get("year")
                 link = edition.get("link", "")
                 tzinfo = parse_timezone(edition.get("timezone", "AoE"))
+                conf_date = edition.get("date", "")
+                conf_place = edition.get("place", "")
 
                 for tl in edition.get("timeline", []):
-                    deadline = tl.get("deadline")
-                    comment = tl.get("comment", "Deadline")
+                    comment = tl.get("comment", "Paper deadline")
+                    abstract_deadline = tl.get("abstract_deadline")
+                    paper_deadline = tl.get("deadline")
 
-                    if not deadline or deadline == "TBD":
-                        continue
+                    if abstract_deadline:
+                        abstract_label = "Abstract deadline"
+                        if comment and comment != "Paper deadline":
+                            abstract_label = f"Abstract deadline ({comment})"
 
-                    try:
-                        dt = datetime.strptime(
-                            deadline, "%Y-%m-%d %H:%M:%S"
-                        ).replace(tzinfo=tzinfo)
-                    except ValueError:
-                        continue
+                        add_deadline_event(
+                            cal=cal,
+                            seen_uids=seen_uids,
+                            now=now,
+                            dblp=dblp,
+                            title=title,
+                            year=year,
+                            description=description,
+                            conf_date=conf_date,
+                            conf_place=conf_place,
+                            link=link,
+                            tzinfo=tzinfo,
+                            deadline_value=abstract_deadline,
+                            event_label=abstract_label,
+                        )
 
-                    if dt.astimezone(timezone.utc) < now:
-                        continue
-
-                    uid = make_event_uid(dblp, year, deadline, comment)
-                    if uid in seen_uids:
-                        continue
-                    seen_uids.add(uid)
-
-                    ev = Event()
-                    ev.add("uid", uid)
-                    ev.add("dtstamp", now)
-                    ev.add("summary", f"{title} {year} — {comment}")
-                    ev.add("dtstart", dt)
-                    ev.add("dtend", dt + timedelta(hours=1))
-
-                    desc_lines = [
-                        f"{title} {year}",
-                        str(comment),
-                        str(description),
-                        f"DBLP key: {dblp}",
-                    ]
-                    if link:
-                        desc_lines.append(str(link))
-
-                    ev.add("description", "\n".join(desc_lines))
-
-                    if link:
-                        ev.add("url", link)
-
-                    cal.add_component(ev)
+                    paper_label = comment or "Paper deadline"
+                    add_deadline_event(
+                        cal=cal,
+                        seen_uids=seen_uids,
+                        now=now,
+                        dblp=dblp,
+                        title=title,
+                        year=year,
+                        description=description,
+                        conf_date=conf_date,
+                        conf_place=conf_place,
+                        link=link,
+                        tzinfo=tzinfo,
+                        deadline_value=paper_deadline,
+                        event_label=paper_label,
+                    )
 
     return cal
-
 
 # ----------------------------
 # Output helpers
