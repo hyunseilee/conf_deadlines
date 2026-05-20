@@ -289,32 +289,26 @@ def add_deadline_event(
     except ValueError:
         return
 
-    if dt.astimezone(timezone.utc) < now:
-        return
-
     uid = make_event_uid(dblp, year, deadline_value, event_label)
     if uid in seen_uids:
         return
     seen_uids.add(uid)
 
-    summary_parts = [f"{title} {year}", event_label]
+    summary = f"{title} {year} — {event_label}"
     if conf_date:
-        summary_parts.append(f"[{conf_date}]")
+        summary += f" [{conf_date}]"
 
     ev = Event()
     ev.add("uid", uid)
     ev.add("dtstamp", now)
-    ev.add("summary", " — ".join(summary_parts[:2]) + (f" {summary_parts[2]}" if len(summary_parts) > 2 else ""))
+    ev.add("summary", summary)
     ev.add("dtstart", dt)
     ev.add("dtend", dt + timedelta(hours=1))
 
     if conf_place:
         ev.add("location", conf_place)
 
-    desc_lines = [
-        f"{title} {year}",
-        f"Deadline type: {event_label}",
-    ]
+    desc_lines = [f"{title} {year}", f"Deadline type: {event_label}"]
 
     if description:
         desc_lines.append(str(description))
